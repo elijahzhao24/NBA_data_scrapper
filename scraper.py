@@ -55,6 +55,7 @@ def listPlayerObjects(soup):
 
     return temp
 
+# Not used as we are directly uploading to supabase db 
 def export_csvs(players, season_year, teams_filename='teams.csv', players_filename='players.csv'):
     teams_seen = {}
 
@@ -126,6 +127,104 @@ def export_csvs(players, season_year, teams_filename='teams.csv', players_filena
         print(f"Exported {len(teams_seen)} unique teams -> {teams_filename}")
         print(f"Exported {sum(1 for _ in players)} players -> {players_filename}")
 
+
+def build_teams_from_players(players):
+    # Return a dict mapping team_code -> {'code': code, 'name': fullname}
+    teams_seen = {}
+
+    for p in players:
+        code = (p.team or "").strip().upper()
+        if not code:
+            continue
+        name = NBA_TEAMS.get(code, "ERROR TEAM NOT FOUND")  
+        teams_seen[code] = {"code": code, "name": name}
+    return teams_seen
+
+def upsert_teams(conn, teams_seen):
+    
+    # Upsert teams into the teams table and return a mapping: code -> id
+
+
+    # convert teams_seen dict to list of tuples for bulk insert
+    rows = [(t['code'], t['name']) for t in teams_seen.values()]
+
+    sql = """
+    INSERT INTO teams (code, name)
+    VALUES %s
+    ON CONFLICT (code) DO UPDATE
+      SET name = EXCLUDED.name   --  When there is duplicate, update team name
+    RETURNING id, code;         --  return tuple with team code and team.id
+    """
+
+    with conn.cursor() as cur:
+
+        # execute_values expands VALUES %s with many rows efficiently
+        execute_values(cur, sql, rows, template="(%s, %s)")
+
+        # fetchall returns list of (id, code) for inserted/updated rows
+        returned = cur.fetchall()
+
+    conn.commit()
+
+    # build mapping code -> id for player one to many relation
+    code_to_id = {row[1]: row[0] for row in returned}
+    return code_to_id
+
+
+def upsert_players(conn, players, code_to_id, season_year):
+
+    # Upsert players into the players table.
+
+    now_iso = datetime.now().isoformat()
+
+    # Convert Player objects to list of tuples for bulk insert
+    rows = []
+    nplayers = 0
+
+    for p in players:
+        nplayers +=1
+        team_code = (p.team or "").strip().upper()
+        if not team_code or team_code not in code_to_id:
+            continue  # Skip if not recognized
+
+        # remove "$" and "," then cast to int from salary
+        salary_val = int(p.salary.replace("$", "").replace(",", ""))
+
+        # Create hash string
+        hash_source = f"{p.code}|{p.name}|{team_code}|{season_year}|{salary_val}"
+        row_hash = hashlib.sha256(hash_source.encode("utf-8")).hexdigest()
+
+        rows.append((
+            p.code,                 # site_player_id
+            p.name,                 # name
+            team_code,              # team (short code)
+            code_to_id[team_code],  # team_id from teams table
+            season_year,            # year
+            salary_val,             # salary
+            row_hash,               # row_hash
+            now_iso                 # last_scrape
+        ))
+
+    sql = """
+    INSERT INTO players
+      (site_player_id, name, team, team_id, year, salary, row_hash, last_scrape)
+    VALUES %s
+    ON CONFLICT (site_player_id, year) DO UPDATE     -- if a player id and the same year exists, replace according data
+      SET name = EXCLUDED.name,
+          team = EXCLUDED.team,
+          team_id = EXCLUDED.team_id,
+          salary = EXCLUDED.salary,
+          row_hash = EXCLUDED.row_hash,
+          last_scrape = EXCLUDED.last_scrape;
+    """
+
+    with conn.cursor() as cur:
+        execute_values(cur, sql, rows,
+            template="(%s, %s, %s, %s, %s, %s, %s, %s)"
+        )
+    conn.commit()
+    return nplayers
+
 NBA_TEAMS = {
     "ATL": "Atlanta Hawks",
     "BOS": "Boston Celtics",
@@ -196,7 +295,8 @@ ul1 = main1.find("ul", class_=["list-group", "mb-4", "not-premium"])
 lis = ul1.find_all(class_ = ["list-group-item"])
 
 playerlist = listPlayerObjects(lis)
-export_csvs(playerlist, season_year=2025)
+#export_csvs(playerlist, season_year=2025)
+
 
 
 
@@ -211,5 +311,13 @@ cur = conn.cursor()
 
 cur.execute("SELECT NOW();")
 print("Connected to Postgres at:", cur.fetchone())
+
+teams_seen = build_teams_from_players(playerlist)
+# Comment: upsert_teams returns a dict mapping team_code -> teams.id
+code_to_id = upsert_teams(conn, teams_seen)
+n_players = upsert_players(conn, playerlist, code_to_id, season_year=2025)
+
+print(f"Upserted {len(code_to_id)} teams and processed {n_players} player rows.")
+
 cur.close()
 conn.close()
