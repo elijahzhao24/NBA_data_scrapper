@@ -2,6 +2,13 @@ import os, psycopg2, requests
 import pandas as pd
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
+import csv
+import hashlib
+from datetime import datetime
+import difflib
+from psycopg2.extras import execute_values
+
+
 
 class Player:
     def __init__(self, name, team, salary, code):
@@ -48,8 +55,110 @@ def listPlayerObjects(soup):
 
     return temp
 
+def export_csvs(players, season_year, teams_filename='teams.csv', players_filename='players.csv'):
+    teams_seen = {}
 
-load_dotenv()  
+    for p in players:
+        # ormalize the team code to uppercase and strip whitespace
+        team_code = (p.team or "").strip().upper()
+
+        if not team_code:
+            continue
+
+        # Comment: get full name if available
+        team_name = NBA_TEAMS.get(team_code, "Error")
+        teams_seen[team_code] = {"code": team_code, "name": team_name}
+    
+
+    with open(teams_filename, 'w', newline='', encoding='utf-8') as tf:
+
+        # columns stored in postgres table
+        fieldnames = ['code', 'name']
+
+        writer = csv.DictWriter(tf, fieldnames=fieldnames)
+        writer.writeheader()
+
+        # use sorted so SERIAL PRIMARY KEY is easier to map into player column
+        for tcode in sorted(teams_seen.keys()):
+            writer.writerow(teams_seen[tcode])
+
+        now_iso = datetime.now().isoformat()
+        with open(players_filename, 'w', newline='', encoding='utf-8') as pf:
+
+            # columns stored in postgres table
+            fieldnames = ['site_player_id', 'name', 'team', 'year', 'salary', 'row_hash', 'last_scrape']
+
+            writer = csv.DictWriter(pf, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for p in players:
+                team_code = (p.team or "").strip().upper()
+                if not team_code:
+                    #Skip or handle players missing team codes. Here we skip.
+                    continue
+
+                # remove '$' and ',' and cast to int
+                salary_text = str(p.salary) if p.salary is not None else ""
+
+                # Remove dollar sign and thousands separators, then trim whitespace
+                salary_text = salary_text.replace("$", "").replace(",", "").strip()
+
+                # If after cleaning we have something, convert to int; otherwise leave as None (empty CSV cell)
+                try:
+                    salary_val = int(salary_text) if salary_text != "" else None
+                except ValueError:
+                    salary_val = None
+
+                # Create a hash for the row for duplicate detection
+                hash_source = f"{p.code}|{p.name}|{team_code}|{season_year}|{salary_val}"
+                row_hash = hashlib.sha256(hash_source.encode('utf-8')).hexdigest()
+
+                writer.writerow({
+                    'site_player_id': p.code,
+                    'name': p.name,
+                    'team': team_code,
+                    'year': int(season_year),
+                    'salary': salary_val,
+                    'row_hash': row_hash,
+                    'last_scrape': now_iso
+                })
+        
+        print(f"Exported {len(teams_seen)} unique teams -> {teams_filename}")
+        print(f"Exported {sum(1 for _ in players)} players -> {players_filename}")
+
+NBA_TEAMS = {
+    "ATL": "Atlanta Hawks",
+    "BOS": "Boston Celtics",
+    "BKN": "Brooklyn Nets",
+    "CHA": "Charlotte Hornets",
+    "CHI": "Chicago Bulls",
+    "CLE": "Cleveland Cavaliers",
+    "DAL": "Dallas Mavericks",
+    "DEN": "Denver Nuggets",
+    "DET": "Detroit Pistons",
+    "GSW": "Golden State Warriors",
+    "HOU": "Houston Rockets",
+    "IND": "Indiana Pacers",
+    "LAC": "Los Angeles Clippers",
+    "LAL": "Los Angeles Lakers",
+    "MEM": "Memphis Grizzlies",
+    "MIA": "Miami Heat",
+    "MIL": "Milwaukee Bucks",
+    "MIN": "Minnesota Timberwolves",
+    "NOP": "New Orleans Pelicans",
+    "NYK": "New York Knicks",
+    "OKC": "Oklahoma City Thunder",
+    "ORL": "Orlando Magic",
+    "PHI": "Philadelphia 76ers",
+    "PHX": "Phoenix Suns",
+    "POR": "Portland Trail Blazers",
+    "SAC": "Sacramento Kings",
+    "SAS": "San Antonio Spurs",
+    "TOR": "Toronto Raptors",
+    "UTA": "Utah Jazz",
+    "WAS": "Washington Wizards",
+}
+
 URL = 'https://www.spotrac.com/nba/rankings/player/_/year/2025/sort/cash_total'
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -61,6 +170,7 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
+load_dotenv()  
 
 def fetch_page(url, session=None, tries=3):
     s = session or requests.Session()
@@ -86,6 +196,7 @@ ul1 = main1.find("ul", class_=["list-group", "mb-4", "not-premium"])
 lis = ul1.find_all(class_ = ["list-group-item"])
 
 playerlist = listPlayerObjects(lis)
+export_csvs(playerlist, season_year=2025)
 
 
 
