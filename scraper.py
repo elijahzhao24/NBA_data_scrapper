@@ -7,6 +7,16 @@ import hashlib
 from datetime import datetime
 import difflib
 from psycopg2.extras import execute_values
+import re
+import time
+import unicodedata
+from urllib.parse import urljoin, unquote
+import json
+import mimetypes
+from rembg import new_session, remove
+from PIL import Image
+import io
+
 
 
 
@@ -225,6 +235,238 @@ def upsert_players(conn, players, code_to_id, season_year):
     conn.commit()
     return nplayers
 
+def normalize_name_for_match(name: str) -> str:
+    if not name:
+        return ""
+    # de-accent
+    nfkd = unicodedata.normalize('NFKD', name)
+    only_ascii = "".join([c for c in nfkd if not unicodedata.combining(c)])
+
+    # lowercase, remove punctuation except hyphen and space
+    s = re.sub(r"[^a-zA-Z0-9\-\s]", "", only_ascii).strip().lower()
+
+    # collapse multiple spaces
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def scrape_realgm_player_links(index_url='https://basketball.realgm.com/nba/players'):
+ 
+    resp = requests.get(index_url, timeout=20)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.content, 'html.parser')
+    td_elements = soup.find_all('td', {'data-th': 'Player'})
+    mapping = {}
+    duplicates = {}
+    for td in td_elements:
+        a = td.find('a')
+        if not a:
+            continue
+        raw_name = a.get_text(strip=True)
+        href = a.get('href')
+        key = normalize_name_for_match(raw_name)
+        if key in mapping:
+
+            # handle duplicates by keeping first and logging
+            duplicates.setdefault(key, []).append(href)
+            continue
+        mapping[key] = href
+    if duplicates:
+        print(f"[WARN] {len(duplicates)} duplicate normalized names found in RealGM index (kept first occurrence).")
+    print(f"[OK] scraped RealGM index: {len(mapping)} players")
+    return mapping
+
+
+def get_realgm_headshot_info(relative_link):
+    from urllib.parse import urljoin, unquote
+    import re, unicodedata
+
+    base = "https://basketball.realgm.com"
+    full = urljoin(base, relative_link)
+
+    r = requests.get(full, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.content, "html.parser")
+
+    image = None
+    container = soup.find("div", class_="player_profile_headshot")
+    if container:
+        image = container.find("img")
+    if not image:
+        return "could not find"
+
+    # Handle lazy-load attributes
+    src = image.get("src") or image.get("data-src") or image.get("data-original")
+    if not src:
+        srcset = image.get("srcset")
+        if srcset:
+            # take the first candidate url
+            src = srcset.split(",")[0].split()[0]
+
+    if not src:
+        return None
+
+    src = urljoin(base, src)
+    filename = unquote(src.split("/")[-1])
+
+    # Prefer the RealGM player id from the link itself (e.g., .../Summary/104915)
+    m = re.search(r"/Summary/(\d+)", relative_link)
+    site_id = m.group(1) if m else None
+
+    # Page title name (nice to have)
+    h1 = soup.find("h1")
+    player_name = h1.get_text(strip=True) if h1 else None
+
+    return {"url": src, "filename": filename, "site_id": site_id, "player_name": player_name}
+
+def download_image_bytes(url, timeout=20):
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.content
+
+def upload_to_supabase_storage(remote_path, file_bytes, content_type=None):
+    #Upload raw bytes to Supabase Storage using the REST endpoint.
+
+    SUPABASE_URL = os.getenv("SUPABASE_URL")
+    SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+    SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "player-headshots")
+
+    # determine content type if not provided
+    if not content_type:
+        content_type = mimetypes.guess_type(remote_path)[0] or "application/octet-stream"
+
+
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{remote_path}"
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Content-Type": content_type
+    }
+    resp = requests.post(upload_url, headers=headers, data=file_bytes, timeout=60)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"Supabase upload failed ({resp.status_code}): {resp.text}")
+
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{remote_path}"
+    return public_url
+
+def update_player_headshot_url(conn, site_player_id, season_year, headshot_url):
+
+    sql = """
+    UPDATE players
+       SET headshot_url = COALESCE(%s, headshot_url)
+     WHERE site_player_id = %s AND year = %s;
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (headshot_url, str(site_player_id), int(season_year)))
+    conn.commit()
+    return True
+
+# def remove_bg(image_bytes: bytes) -> bytes:
+
+#     output_bytes = remove(image_bytes)
+#     img = Image.open(io.BytesIO(output_bytes)).convert("RGBA")
+#     buffer = io.BytesIO()
+#     img.save(buffer, format="PNG")
+#     return buffer.getvalue()
+
+def upload_headshot_for_player(conn, player_obj, headshot_info, season_year=2025, sleep_after=0.25):
+
+    """
+    Given a Player object and headshot_info, upload the image and update DB.
+    Returns the public_url on success, or None on failure.
+    """
+    
+    if not headshot_info or not isinstance(headshot_info, dict) or not headshot_info.get("url"):
+        print(f"[SKIP] invalid headshot_info for {player_obj.name}")
+        return None
+
+    try:
+        # Download
+        img_bytes = download_image_bytes(headshot_info["url"])
+        # img_bytes = remove_bg(img_bytes)
+
+        # 2) Choose extension and remote path
+        raw_fname = headshot_info.get("filename") or ""
+        ext = raw_fname.split(".")[-1].lower() if "." in raw_fname else "jpg"
+        remote_path = f"headshots/{player_obj.code}.{ext}"
+
+        # 3) Content-Type
+        content_type = mimetypes.guess_type(remote_path)[0] or "image/jpeg"
+
+        # 4) Upload
+        public_url = upload_to_supabase_storage(remote_path, img_bytes, content_type=content_type)
+        print(f"[OK] uploaded headshot for {player_obj.name} -> {public_url}")
+
+        # 5) Update DB
+        update_player_headshot_url(conn, player_obj.code, season_year, public_url)
+
+        # polite pause
+        time.sleep(sleep_after)
+        return public_url
+
+    except Exception as e:
+        print(f"[ERROR] uploading headshot for {player_obj.name} (id={player_obj.code}): {e}")
+        return None
+    
+
+def test_upload_one_player(conn, playerlist, realgm_index, season_year=2025):
+    """
+    Upload headshot for the first player in playerlist (safe test).
+    Prints each step and returns (player, public_url) on success or (player, None) on failure.
+    """
+    if not playerlist:
+        print("No players available in playerlist.")
+        return None, None
+
+    player = playerlist[0]  # change index if you want a different player
+    print(f"TEST: trying player {player.name} (id={player.code})")
+
+    # 1) find RealGM link
+    norm = normalize_name_for_match(player.name)
+    rel_link = realgm_index.get(norm)
+    if not rel_link:
+        print(f"[NO MATCH] RealGM index has no page for {player.name} (normalized='{norm}').")
+        return player, None
+
+    # 2) get headshot info
+    info = get_realgm_headshot_info(rel_link)
+    if not info or info == "could not find" or not info.get("url"):
+        print(f"[NO IMAGE] Could not extract headshot info for {player.name} from {rel_link}")
+        return player, None
+
+    print(f"Found headshot URL: {info['url']} (filename={info.get('filename')})")
+
+    # 3) download image bytes
+    try:
+        img_bytes = download_image_bytes(info['url'])
+    except Exception as e:
+        print(f"[ERROR] downloading image: {e}")
+        return player, None
+
+    # 4) pick extension and remote path (use player's site id)
+    fname = info.get("filename") or ""
+    ext = fname.split(".")[-1].lower() if "." in fname else "jpg"
+    remote_path = f"headshots/{player.code}.{ext}"
+    print(f"Uploading to Supabase as: {remote_path}")
+
+    # 5) upload
+    try:
+        public_url = upload_to_supabase_storage(remote_path, img_bytes, content_type=None)
+    except Exception as e:
+        print(f"[ERROR] upload failed: {e}")
+        return player, None
+
+    print(f"[OK] uploaded -> {public_url}")
+
+    # 6) update DB
+    try:
+        update_player_headshot_url(conn, player.code, season_year, public_url)
+        print(f"[OK] DB updated: players.headshot_url for site_player_id={player.code}, year={season_year}")
+    except Exception as e:
+        print(f"[ERROR] DB update failed: {e}")
+        return player, public_url
+
+    return player, public_url
+
 NBA_TEAMS = {
     "ATL": "Atlanta Hawks",
     "BOS": "Boston Celtics",
@@ -257,7 +499,9 @@ NBA_TEAMS = {
     "UTA": "Utah Jazz",
     "WAS": "Washington Wizards",
 }
-
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "player-headshots")
 URL = 'https://www.spotrac.com/nba/rankings/player/_/year/2025/sort/cash_total'
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -268,6 +512,8 @@ HEADERS = {
     "Referer": "https://www.spotrac.com/",
     "Connection": "keep-alive",
 }
+
+realgm_index = scrape_realgm_player_links() 
 
 load_dotenv()  
 
@@ -318,6 +564,27 @@ code_to_id = upsert_teams(conn, teams_seen)
 n_players = upsert_players(conn, playerlist, code_to_id, season_year=2025)
 
 print(f"Upserted {len(code_to_id)} teams and processed {n_players} player rows.")
+
+# pl, url = test_upload_one_player(conn, playerlist, realgm_index, season_year=2025)
+# if url:
+#     print("Test upload succeeded:", url)
+# else:
+#     print("Test upload failed for player:", pl.name if pl else "(none)")
+
+for p in playerlist:
+    norm = normalize_name_for_match(p.name)
+    rel_link = realgm_index.get(norm)
+    if not rel_link:
+        # optional: you can add difflib fuzzy fallback here if you want
+        print(f"[NO MATCH] RealGM page not found for {p.name}")
+        continue
+
+    info = get_realgm_headshot_info(rel_link)
+    if not info or info == "could not find":
+        print(f"[NO IMAGE] RealGM page has no headshot for {p.name}")
+        continue
+
+    upload_headshot_for_player(conn, p, info, season_year=2025)
 
 cur.close()
 conn.close()

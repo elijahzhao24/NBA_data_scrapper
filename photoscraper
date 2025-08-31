@@ -1,95 +1,14 @@
-import time
-import re
-import unicodedata
-from urllib.parse import urljoin, unquote
-import json
-import difflib
 import os
-import requests
-from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
-def normalize_name_for_match(name: str) -> str:
-    if not name:
-        return ""
-    # de-accent
-    nfkd = unicodedata.normalize('NFKD', name)
-    only_ascii = "".join([c for c in nfkd if not unicodedata.combining(c)])
-    # lowercase, remove punctuation except hyphen and space
-    s = re.sub(r"[^a-zA-Z0-9\-\s]", "", only_ascii).strip().lower()
-    # collapse multiple spaces
-    s = re.sub(r"\s+", " ", s)
-    return s
+# reload env vars (safe to call again)
+load_dotenv(override=True)
 
-def scrape_realgm_player_links(index_url='https://basketball.realgm.com/nba/players'):
-    """
-    Scrape RealGM players index and return dict:
-      normalized_name -> relative_link (like '/player/Shai-Gilgeous-Alexander/Summary/104915')
-    """
-    resp = requests.get(index_url, timeout=20)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.content, 'html.parser')
-    td_elements = soup.find_all('td', {'data-th': 'Player'})
-    mapping = {}
-    duplicates = {}
-    for td in td_elements:
-        a = td.find('a')
-        if not a:
-            continue
-        raw_name = a.get_text(strip=True)
-        href = a.get('href')  # relative link
-        key = normalize_name_for_match(raw_name)
-        if key in mapping:
-            # handle duplicates by keeping first and logging
-            duplicates.setdefault(key, []).append(href)
-            continue
-        mapping[key] = href
-    if duplicates:
-        print(f"[WARN] {len(duplicates)} duplicate normalized names found in RealGM index (kept first occurrence).")
-    print(f"[OK] scraped RealGM index: {len(mapping)} players")
-    return mapping
+def masked(s):
+    if not s: return None
+    return s[:4] + "..." + s[-4:]
 
-
-def get_realgm_headshot_info(relative_link):
-    from urllib.parse import urljoin, unquote
-    import re, unicodedata
-
-    base = "https://basketball.realgm.com"
-    full = urljoin(base, relative_link)
-
-    r = requests.get(full, timeout=20)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.content, "html.parser")
-
-    # 1) Primary: the container you pointed out
-    image = None
-    container = soup.find("div", class_="player_profile_headshot")
-    if container:
-        image = container.find("img")
-    if not image:
-        return "could not find"
-
-    # Handle lazy-load attributes
-    src = image.get("src") or image.get("data-src") or image.get("data-original")
-    if not src:
-        srcset = image.get("srcset")
-        if srcset:
-            # take the first candidate url
-            src = srcset.split(",")[0].split()[0]
-
-    if not src:
-        return None
-
-    src = urljoin(base, src)
-    filename = unquote(src.split("/")[-1])
-
-    # Prefer the RealGM player id from the link itself (e.g., .../Summary/104915)
-    m = re.search(r"/Summary/(\d+)", relative_link)
-    site_id = m.group(1) if m else None
-
-    # Page title name (nice to have)
-    h1 = soup.find("h1")
-    player_name = h1.get_text(strip=True) if h1 else None
-
-    return {"url": src, "filename": filename, "site_id": site_id, "player_name": player_name}
-
-print(get_realgm_headshot_info("/player/LeBron-James/Summary/250"))
+print("DATABASE_URL:", bool(os.getenv("DATABASE_URL")))
+print("SUPABASE_URL:", os.getenv("SUPABASE_URL"))
+print("SUPABASE_BUCKET:", os.getenv("SUPABASE_BUCKET"))
+print("SUPABASE_SERVICE_KEY present?:", masked(os.getenv("SUPABASE_SERVICE_KEY")))

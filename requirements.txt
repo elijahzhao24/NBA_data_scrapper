@@ -6,3 +6,11 @@ lxml
 pandas
 datetime
 difflib
+re
+time
+unicodedata
+json
+mimetypes
+rembg
+Pillow
+onnxruntime
