@@ -307,7 +307,7 @@ if not DATABASE_URL:
     raise ValueError("DATABASE_URL not set")
 
 conn = psycopg2.connect(DATABASE_URL)
-cur = conn.cursor()
+cur = conn.cursor() 
 
 cur.execute("SELECT NOW();")
 print("Connected to Postgres at:", cur.fetchone())
